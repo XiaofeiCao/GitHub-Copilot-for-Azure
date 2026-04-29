@@ -36,8 +36,15 @@ import {
   softCheckSkill,
   withTestResult,
 } from "../utils/evaluate";
+import { cloneRepo } from "../utils/git-clone";
 
 const SKILL_NAME = "azure-upgrade";
+
+// Remote Java legacy-SDK example repo used as the source of truth for the
+// Java SDK migration end-to-end tests. Each test sparse-checks out a single
+// example project under this repo into the agent workspace.
+const JAVA_UPDATE_EXAMPLES_REPO =
+  "https://github.com/weidongxu-microsoft/java-update-examples";
 
 // Java SDK migration is a real, multi-phase workflow (precheck → plan →
 // execute → summarize) that may run for several minutes. Use the same
@@ -146,21 +153,38 @@ describeIntegration(`${SKILL_NAME}_ - Integration Tests`, () => {
       return stripXmlComments(fs.readFileSync(pomPath, "utf8"));
     };
 
-    const runJavaMigration = async (fixtureDir: string): Promise<{
+    // Extract only the contents of <dependency>...</dependency> blocks so
+    // that groupId/artifactId assertions ignore unrelated coordinates that
+    // may appear in <parent>, <plugin>, <pluginManagement>, <exclusions>,
+    // etc. Both top-level <dependencies> and <dependencyManagement>
+    // entries are wrapped in <dependency> elements, so azure-sdk-bom
+    // (declared under dependencyManagement) is still covered.
+    const extractDependencyBlocks = (pomNoComments: string): string => {
+      const matches = pomNoComments.match(/<dependency>[\s\S]*?<\/dependency>/g);
+      expect(matches).not.toBeNull();
+      expect((matches as RegExpMatchArray).length).toBeGreaterThan(0);
+      return (matches as RegExpMatchArray).join("\n");
+    };
+
+    const runJavaMigration = async (sparseCheckoutPath: string): Promise<{
       agentMetadata: Awaited<ReturnType<typeof agent.run>>;
       workspacePath: string;
+      projectPath: string;
     }> => {
       let workspacePath: string | undefined;
       const agentMetadata = await agent.run({
         setup: async (workspace: string) => {
           workspacePath = workspace;
-          fs.cpSync(
-            `./azure-upgrade/resources/${fixtureDir}/`,
-            workspace,
-            { recursive: true }
-          );
+          await cloneRepo({
+            repoUrl: JAVA_UPDATE_EXAMPLES_REPO,
+            targetDir: workspace,
+            depth: 1,
+            sparseCheckoutPath,
+          });
         },
-        prompt: "Migrate my Java project from legacy Azure SDK to modern Azure SDK",
+        prompt:
+          "Migrate my Java project from legacy Azure SDK to modern Azure SDK. " +
+          `The project can be found under ${sparseCheckoutPath}.`,
         nonInteractive: true,
         followUp: FOLLOW_UP_PROMPT,
         followUpTimeout: javaMigrationTimeoutMs,
@@ -171,31 +195,33 @@ describeIntegration(`${SKILL_NAME}_ - Integration Tests`, () => {
       expect(isSkillInvoked(agentMetadata, SKILL_NAME)).toBe(true);
       expect(workspacePath).toBeDefined();
 
-      return { agentMetadata, workspacePath: workspacePath as string };
+      const projectPath = path.join(workspacePath as string, sparseCheckoutPath);
+      return { agentMetadata, workspacePath: workspacePath as string, projectPath };
     };
 
     test("migrates legacy file-based Azure auth (client init) to DefaultAzureCredential", async () => {
       await withTestResult(async () => {
-        const { workspacePath } = await runJavaMigration("java-legacy-sdk-client-init");
+        const { projectPath } = await runJavaMigration("azure-legacy-sdk-update-azure-client-initialization");
 
-        const pomNoComments = readPomNoComments(workspacePath);
+        const pomNoComments = readPomNoComments(projectPath);
+        const dependencyBlocks = extractDependencyBlocks(pomNoComments);
 
         // 1. No remaining legacy com.microsoft.azure dependencies.
-        expect(pomNoComments).not.toMatch(/<groupId>\s*com\.microsoft\.azure\s*<\/groupId>/);
+        expect(dependencyBlocks).not.toMatch(/<groupId>\s*com\.microsoft\.azure\s*<\/groupId>/);
 
         // 2. azure-sdk-bom is present in dependencyManagement.
-        expect(pomNoComments).toMatch(/<artifactId>\s*azure-sdk-bom\s*<\/artifactId>/);
-        expect(pomNoComments).toMatch(/<groupId>\s*com\.azure\s*<\/groupId>/);
+        expect(dependencyBlocks).toMatch(/<artifactId>\s*azure-sdk-bom\s*<\/artifactId>/);
+        expect(dependencyBlocks).toMatch(/<groupId>\s*com\.azure\s*<\/groupId>/);
 
         // 3. At least one com.azure.resourcemanager:* dependency replaces the
         //    legacy management SDKs.
-        expect(pomNoComments).toMatch(/<groupId>\s*com\.azure\.resourcemanager\s*<\/groupId>/);
+        expect(dependencyBlocks).toMatch(/<groupId>\s*com\.azure\.resourcemanager\s*<\/groupId>/);
 
         // 4. No migrated Java source still references AZURE_AUTH_LOCATION.
         //    Per com.microsoft.azure.management.md, the file-based
         //    `.authenticate(File)` flow must be replaced with
         //    DefaultAzureCredential.
-        for (const javaFile of collectJavaFiles(workspacePath)) {
+        for (const javaFile of collectJavaFiles(projectPath)) {
           const codeNoComments = stripJavaComments(fs.readFileSync(javaFile, "utf8"));
           expect(codeNoComments).not.toMatch(/AZURE_AUTH_LOCATION/);
         }
@@ -204,16 +230,17 @@ describeIntegration(`${SKILL_NAME}_ - Integration Tests`, () => {
 
     test("migrates EventProcessorHost InMemory managers to BlobCheckpointStore", async () => {
       await withTestResult(async () => {
-        const { workspacePath } = await runJavaMigration("java-legacy-sdk-eventhubs");
+        const { projectPath } = await runJavaMigration("azure-legacy-sdk-update-eventhubs-v3");
 
-        const pomNoComments = readPomNoComments(workspacePath);
+        const pomNoComments = readPomNoComments(projectPath);
+        const dependencyBlocks = extractDependencyBlocks(pomNoComments);
 
         // 1. No remaining legacy com.microsoft.azure dependencies.
-        expect(pomNoComments).not.toMatch(/<groupId>\s*com\.microsoft\.azure\s*<\/groupId>/);
+        expect(dependencyBlocks).not.toMatch(/<groupId>\s*com\.microsoft\.azure\s*<\/groupId>/);
 
         // 2. azure-sdk-bom + com.azure are the new home.
-        expect(pomNoComments).toMatch(/<artifactId>\s*azure-sdk-bom\s*<\/artifactId>/);
-        expect(pomNoComments).toMatch(/<groupId>\s*com\.azure\s*<\/groupId>/);
+        expect(dependencyBlocks).toMatch(/<artifactId>\s*azure-sdk-bom\s*<\/artifactId>/);
+        expect(dependencyBlocks).toMatch(/<groupId>\s*com\.azure\s*<\/groupId>/);
 
         // 3. EventProcessorHost migration: no InMemory* checkpoint/lease
         //    types may survive in code (the skill explicitly forbids keeping
@@ -221,7 +248,7 @@ describeIntegration(`${SKILL_NAME}_ - Integration Tests`, () => {
         //    Comments are stripped, so behavioral-change notes referencing
         //    "InMemoryCheckpointManager" are allowed.
         let sawBlobCheckpointStore = false;
-        for (const javaFile of collectJavaFiles(workspacePath)) {
+        for (const javaFile of collectJavaFiles(projectPath)) {
           const codeNoComments = stripJavaComments(fs.readFileSync(javaFile, "utf8"));
           expect(codeNoComments).not.toMatch(/\bInMemory[A-Z]\w*/);
           if (/\bBlobCheckpointStore\b/.test(codeNoComments)) {
@@ -237,23 +264,24 @@ describeIntegration(`${SKILL_NAME}_ - Integration Tests`, () => {
 
     test("migrates Batch defineNewApplicationPackage chain to applicationPackages().define()", async () => {
       await withTestResult(async () => {
-        const { workspacePath } = await runJavaMigration("java-legacy-sdk-batch");
+        const { projectPath } = await runJavaMigration("azure-legacy-sdk-update-batch-java-manage-batch-accounts");
 
-        const pomNoComments = readPomNoComments(workspacePath);
+        const pomNoComments = readPomNoComments(projectPath);
+        const dependencyBlocks = extractDependencyBlocks(pomNoComments);
 
         // 1. No remaining legacy com.microsoft.azure dependencies.
-        expect(pomNoComments).not.toMatch(/<groupId>\s*com\.microsoft\.azure\s*<\/groupId>/);
+        expect(dependencyBlocks).not.toMatch(/<groupId>\s*com\.microsoft\.azure\s*<\/groupId>/);
 
         // 2. At least one com.azure.resourcemanager:* dependency replaces the
         //    legacy azure-mgmt-batch SDK.
-        expect(pomNoComments).toMatch(/<groupId>\s*com\.azure\.resourcemanager\s*<\/groupId>/);
+        expect(dependencyBlocks).toMatch(/<groupId>\s*com\.azure\.resourcemanager\s*<\/groupId>/);
 
         // 3. Batch application-package migration: per
         //    com.microsoft.azure.management.md, the legacy
         //    `.defineNewApplicationPackage(...)` chain on BatchAccount must be
         //    rewritten to top-level `.applicationPackages().define(...)`.
         let sawApplicationPackagesDefine = false;
-        for (const javaFile of collectJavaFiles(workspacePath)) {
+        for (const javaFile of collectJavaFiles(projectPath)) {
           const codeNoComments = stripJavaComments(fs.readFileSync(javaFile, "utf8"));
           if (/applicationPackages\(\s*\)\s*\.define\s*\(/.test(codeNoComments)) {
             sawApplicationPackagesDefine = true;
